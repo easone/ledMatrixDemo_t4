@@ -1,4 +1,5 @@
-// Proof of concept matrix test
+/* Proof of concept demo display driver for LED Matrix using Teensy 4.0.
+ * Uses Pixelmatix SmartLED Shield. Some jumper wires are necessary. */
 
 #include <Arduino.h>
 #include <FlexIO_t4.h> // requires FlexIO_t4 library from https://github.com/KurtE/FlexIO_t4
