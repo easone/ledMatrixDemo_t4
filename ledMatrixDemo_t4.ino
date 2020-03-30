@@ -15,7 +15,7 @@
 
 #define LATCH_TIMER_PULSE_WIDTH_NS  80  // 20 is minimum working value, don't exceed 160 to avoid interference between latch and data transfer
 #define LATCH_TO_CLK_DELAY_NS       400  // max delay from rising edge of latch pulse to first pixel clock
-#define PANEL_PIXELDATA_TRANSFER_MAXIMUM_NS  42  // time to transfer 1 pixel of data at FlexIO clock rate of 240 MHz (with CLOCK_DIVIDER=10)
+#define PANEL_PIXELDATA_TRANSFER_MAXIMUM_NS  42  // time to transfer 1 pixel of data at FlexIO clock rate with FLEXIO_CLOCK_DIVIDER=20
 
 #define LATCH_TIMER_PRESCALE  1
 #define TIMER_FREQUENCY     (F_BUS_ACTUAL>>LATCH_TIMER_PRESCALE)
