@@ -5,7 +5,7 @@ This arduino sketch enables a Teensy 4.0 to drive a [32x64 LED matrix panel](htt
 
 ![Photo of Teensy 4.0 on the SmartLED Shield](photo.JPG)
 
-The panel driver uses hardware features of the Teensy 4.0 and SmartLED Shield to drive the panel with near zero CPU overhead. It uses the FlexIO and FlexPWM peripherals together with Direct Memory Access (DMA) to push pixel data to the panel thousands of times per second. In theory, most of the full capabilities of the SmartMatrix library could be ported over to Teensy 4.0 using this technique.
+The panel driver uses hardware features of the Teensy 4.0 and SmartLED Shield to drive the panel with near zero CPU overhead. It uses the FlexIO and FlexPWM peripherals together with Direct Memory Access (DMA) to push pixel data to the panel thousands of times per second. In theory, most of the full capabilities of the SmartMatrix library could be ported over to Teensy 4.0 using this technique. This is only a proof of concept to demonstrate the low-level panel interface and fast row updating to produce good color accuracy. It currently lacks a full suite of features (e.g. multiple panels, double buffering, drawing routines, etc).
 
 In order to get it set up, you need to make some modifications to the Teensy: two jumper wires must be soldered to pins 32 (yellow) and 33 (green) on the underside of the board before inserting it into the SmartLED Shield. Additionally, there are 4 more jumper wires which must be inserted into the SmartLED shield sockets. Wire together pins 10 & 14, 2 & 12, 11 & 20, 9 & 21, 5 & 32, and 3 & 33. See the image below.
 
