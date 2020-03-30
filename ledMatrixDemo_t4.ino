@@ -22,7 +22,7 @@
 #define LATCH_TIMER_PULSE_WIDTH_TICKS   NS_TO_TICKS(LATCH_TIMER_PULSE_WIDTH_NS)
 
 uint8_t panelBrightness = 127; // range 0-255
-const uint8_t latchesPerRow = 1; // controls the color depth per pixel; value from 1 to 16; 8 is 24bit truecolor
+const uint8_t latchesPerRow = 12; // controls the color depth per pixel; value from 1 to 16; 8 is 24bit truecolor
 uint16_t refreshRate = 200; // frames per second. With 12bit color depth, works up to 580 FPS at 600 MHz (720 FPS at 816 MHz)
 #define MIN_REFRESH_RATE    (((TIMER_FREQUENCY/65535)/ROWSPERFRAME/2) + 1) // cannot refresh slower than this due to PWM register overflow
 
