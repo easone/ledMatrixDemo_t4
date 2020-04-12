@@ -12,15 +12,15 @@
 #define SMARTMATRIX_OPTIONS_C_SHAPE_STACKING        (1 << 0)
 #define SMARTMATRIX_OPTIONS_BOTTOM_TO_TOP_STACKING  (1 << 1)
 
-const int matrixWidth = 128; // height of the overall display
-const int matrixHeight = 64; // width of the overall display
+const int matrixWidth = 128; // width of the overall display
+const int matrixHeight = 64; // height of the overall display
 const int matrixPanelHeight = 32; // height of the individual panels making up the display
-const unsigned char optionFlags = SMARTMATRIX_OPTIONS_C_SHAPE_STACKING;
+const unsigned char optionFlags = SMARTMATRIX_OPTIONS_NONE;
 
 uint8_t panelBrightness = 64; // range 0-255
 const uint8_t latchesPerRow = 12; // controls the color depth per pixel; value from 1 to 16; 8 is 24bit truecolor
 uint16_t refreshRate = 200; // frames per second. With 12bit color depth, works up to 580 FPS at 600 MHz (720 FPS at 816 MHz)
-const uint8_t dmaBufferNumRows = 4; // number of rows of pixel data in rowDataBuffer
+const uint8_t dmaBufferNumRows = 4; // number of rows of pixel data in rowDataBuffer; minimum 2; increasing helps with stability
 
 #define LATCH_TIMER_PULSE_WIDTH_NS  80  // 20 is minimum working value, don't exceed 160 to avoid interference between latch and data transfer
 #define LATCH_TO_CLK_DELAY_NS       400  // max delay from rising edge of latch pulse to first pixel clock
