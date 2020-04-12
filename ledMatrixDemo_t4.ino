@@ -8,24 +8,31 @@
 #include "imageData.h"
 #include "gammaLUT.h"
 
-#define MATRIXWIDTH 64
-#define MATRIXHEIGHT 32
-#define ROWSPERFRAME 16
-#define PIXELS_PER_LATCH 64
+#define SMARTMATRIX_OPTIONS_NONE                    0
+#define SMARTMATRIX_OPTIONS_C_SHAPE_STACKING        (1 << 0)
+#define SMARTMATRIX_OPTIONS_BOTTOM_TO_TOP_STACKING  (1 << 1)
+
+const int matrixWidth = 128; // height of the overall display
+const int matrixHeight = 64; // width of the overall display
+const int matrixPanelHeight = 32; // height of the individual panels making up the display
+const unsigned char optionFlags = SMARTMATRIX_OPTIONS_C_SHAPE_STACKING;
+
+uint8_t panelBrightness = 64; // range 0-255
+const uint8_t latchesPerRow = 12; // controls the color depth per pixel; value from 1 to 16; 8 is 24bit truecolor
+uint16_t refreshRate = 200; // frames per second. With 12bit color depth, works up to 580 FPS at 600 MHz (720 FPS at 816 MHz)
+const uint8_t dmaBufferNumRows = 4; // number of rows of pixel data in rowDataBuffer
 
 #define LATCH_TIMER_PULSE_WIDTH_NS  80  // 20 is minimum working value, don't exceed 160 to avoid interference between latch and data transfer
 #define LATCH_TO_CLK_DELAY_NS       400  // max delay from rising edge of latch pulse to first pixel clock
-#define PANEL_PIXELDATA_TRANSFER_MAXIMUM_NS  42  // time to transfer 1 pixel of data at FlexIO clock rate with FLEXIO_CLOCK_DIVIDER=20
+#define PANEL_PIXELDATA_TRANSFER_MAXIMUM_NS  43  // time to transfer 1 pixel of data at FlexIO clock rate with FLEXIO_CLOCK_DIVIDER=20
 
-#define LATCH_TIMER_PRESCALE  1
+#define LATCH_TIMER_PRESCALE  0
 #define TIMER_FREQUENCY     (F_BUS_ACTUAL>>LATCH_TIMER_PRESCALE)
 #define NS_TO_TICKS(X)      (uint32_t)(TIMER_FREQUENCY * ((X) / 1000000000.0) + 0.5)
 #define LATCH_TIMER_PULSE_WIDTH_TICKS   NS_TO_TICKS(LATCH_TIMER_PULSE_WIDTH_NS)
-
-uint8_t panelBrightness = 127; // range 0-255
-const uint8_t latchesPerRow = 12; // controls the color depth per pixel; value from 1 to 16; 8 is 24bit truecolor
-uint16_t refreshRate = 200; // frames per second. With 12bit color depth, works up to 580 FPS at 600 MHz (720 FPS at 816 MHz)
-#define MIN_REFRESH_RATE    (((TIMER_FREQUENCY/65535)/ROWSPERFRAME/2) + 1) // cannot refresh slower than this due to PWM register overflow
+#define MATRIX_STACK_HEIGHT  (matrixHeight / matrixPanelHeight)
+#define PIXELS_PER_LATCH  (matrixWidth * MATRIX_STACK_HEIGHT)
+#define INLINE __attribute__( ( always_inline ) ) inline
 
 typedef struct rgb24 {
     rgb24() : rgb24(0,0,0) {}
@@ -57,19 +64,26 @@ IMXRT_FLEXIO_t *flexIO;
 DMAChannel dataTransferDMA, enablerDMA, timerUpdateDMA;
 IMXRT_FLEXPWM_t *flexpwm = &IMXRT_FLEXPWM2;
 
-// buffers used with DMA transfers
-volatile uint32_t DMAMEM rowDataBuffer[latchesPerRow*PIXELS_PER_LATCH*sizeof(uint16_t)/sizeof(uint32_t)];
+const uint16_t dmaBufferBytesPerRow = latchesPerRow*PIXELS_PER_LATCH*sizeof(uint16_t); // each pixel takes two bytes
+const int matrixRowPairOffset = matrixPanelHeight / 2;
+const int matrixRowsPerFrame = matrixPanelHeight / 2;
+
+volatile uint32_t DMAMEM rowDataBuffer[dmaBufferBytesPerRow*dmaBufferNumRows/sizeof(uint32_t)];
 volatile uint8_t DMAMEM enablerSourceByte;
 volatile timerpair DMAMEM timerLUT[latchesPerRow];
-rgb24 DMAMEM matrixBuffer[MATRIXWIDTH*MATRIXHEIGHT];
+unsigned int rowAddressBuffer[dmaBufferNumRows];
+rgb24 matrixBuffer[matrixWidth*matrixHeight];
 
-extern const uint32_t PROGMEM testImage[MATRIXWIDTH*MATRIXHEIGHT]; // in imageData.h
+const uint16_t imageWidth = 64;
+const uint16_t imageHeight = 32;
+extern const uint32_t PROGMEM testImage[imageHeight*imageWidth]; // in imageData.h
 extern const uint16_t PROGMEM gammaLUT8to16[256]; // in gammaLUT.h
-unsigned int currentRow = 0;
-const int dimmingMaximum = 255;
+const uint8_t dimmingMaximum = 255;
 int dimmingFactor = dimmingMaximum - panelBrightness;
+unsigned int rowBufferIndex = 0;
+unsigned int rowBufferFillCount = 0;
 
-void setup() {
+FLASHMEM void setup() {
   Serial.begin(9600);
 
   /* Basic pin setup */
@@ -94,12 +108,12 @@ void setup() {
   *(portControlRegister(4)) = 0xFF;
   *(portControlRegister(33)) = 0xFF;
   
-  loadTestImage();
+  loadTestImage(imageWidth, imageHeight);
   calculateTimerLut();
   flexIOSetup();
   dmaSetup();
-  formatRowData(currentRow);
-  setRowAddress(currentRow);
+  fillRowBuffer();
+  setRowAddress(0);
   flexPWMSetup();
 }
 
@@ -107,20 +121,25 @@ void loop() {
   while(true);
 }
 
-void loadTestImage() {
+FLASHMEM void loadTestImage(uint16_t wd, uint16_t ht) {
   /* Test image (in imageData.h) was generated from a BMP file and is organized bottom-to-top.
-     Need to flip the image top-to-bottom and also convert to bit-packed rgb24 format before storing into matrixBuffer. */
-  for (int i=0; i<MATRIXHEIGHT; i++) {
-    for (int j=0; j<MATRIXWIDTH; j++) {
-      uint32_t c = testImage[(MATRIXHEIGHT-i-1)*MATRIXWIDTH+j];
-      matrixBuffer[i*MATRIXWIDTH+j] = rgb24(c>>16,c>>8,c);
+     Need to flip the image top-to-bottom and also convert to bit-packed rgb24 format before storing into matrixBuffer.
+     Tile the image to fill up the full display. */
+  int widthReps = matrixWidth/wd;
+  int heightReps = matrixHeight/ht;
+  for (int y=0; y<ht; y++) {
+    for (int x=0; x<wd; x++) {
+      uint32_t c = testImage[(imageHeight-y-1)*imageWidth+x];
+      for (int i=0; i<widthReps; i++) {
+        for (int j=0; j<heightReps; j++) {
+          matrixBuffer[(y+j*ht)*matrixWidth+(x+i*wd)] = rgb24(c>>16,c>>8,c);
+        }
+      }      
     }
   }
-  /* flush DMAMEM cache */
-  arm_dcache_flush_delete((void*)matrixBuffer, sizeof(matrixBuffer));
 }
 
-void calculateTimerLut(void) {
+FLASHMEM void calculateTimerLut(void) {
   /* adapted from smartMatrix library
    * This code creates a lookup table with a sequence of PWM period and duty cycles which are associated with the LSB through MSB of the image data.
    * The idea is to switch the LEDs on or off with each bitplane so that the total time is equal to the desired color intensity. The MSB accounts for
@@ -132,15 +151,25 @@ void calculateTimerLut(void) {
    * Note: variable "ontime" is named confusingly; it's the duration of the OE pulse, but the panel is actually disabled when OE is HIGH, so the
    * brightness is controlled by the inverse pulse which has width "timer_period" minus "ontime." */
   
-    #define TICKS_PER_ROW   (TIMER_FREQUENCY/refreshRate/ROWSPERFRAME)
-    #define IDEAL_MSB_BLOCK_TICKS     (TICKS_PER_ROW/2)
+    #define TICKS_PER_ROW   (TIMER_FREQUENCY/refreshRate/matrixRowsPerFrame)
+    #define IDEAL_MSB_BLOCK_TICKS     (TICKS_PER_ROW/2) * (1<<latchesPerRow) / ((1<<latchesPerRow) - 1) 
     #define MIN_BLOCK_PERIOD_NS (LATCH_TO_CLK_DELAY_NS + (PANEL_PIXELDATA_TRANSFER_MAXIMUM_NS*PIXELS_PER_LATCH))
     #define MIN_BLOCK_PERIOD_TICKS NS_TO_TICKS(MIN_BLOCK_PERIOD_NS)
     #define MSB_BLOCK_TICKS_ADJUSTMENT_INCREMENT    10
+    #define MIN_REFRESH_RATE    (((TIMER_FREQUENCY/65535)/matrixRowsPerFrame/2) + 1) // cannot refresh slower than this due to PWM register overflow
 
     int i;
     uint32_t ticksUsed;
     uint16_t msbBlockTicks = IDEAL_MSB_BLOCK_TICKS + MSB_BLOCK_TICKS_ADJUSTMENT_INCREMENT;
+
+    if (MIN_BLOCK_PERIOD_TICKS * latchesPerRow >= TICKS_PER_ROW) {
+      Serial.println("Error: refresh rate too high for this resolution and color depth");
+      exit(1);
+    }
+    if (refreshRate < MIN_REFRESH_RATE) {
+      Serial.println("Error: refresh rate too low - try increasing LATCH_TIMER_PRESCALE");
+      exit(1);
+    }
 
     // start with ideal width of the MSB, and keep lowering until the width of all bits fits within TICKS_PER_ROW
     do {
@@ -178,6 +207,7 @@ void calculateTimerLut(void) {
     arm_dcache_flush_delete((void*)timerLUT, sizeof(timerLUT));
 
     /* print look-up table (for debugging) */
+    Serial.print("Max brightness limited to "); Serial.print(msbBlockTicks*(200-(200>>latchesPerRow))/TICKS_PER_ROW); Serial.println("%");
     for (i = 0; i < latchesPerRow; i++) {
       Serial.print("bitplane "); Serial.print(i);
       Serial.print(": period: "); Serial.print(timerLUT[i].timer_period);
@@ -185,7 +215,7 @@ void calculateTimerLut(void) {
     }
 }
 
-void flexIOSetup() {
+FLASHMEM void flexIOSetup() {
   /* Set up FlexIO peripheral for clocking out data to LED matrix panel. The FlexIO enables parallel output to the panel's RGB data inputs
    * and also generates the clock signal for the panel in hardware. For Teensy 3.x, SmartMatrix uses an 8-bit GPIO port to generate RGB and clock signals
    * by bitbanging, but this is not possible on Teensy 4.0 because the GPIO ports only have 32-bit access and do not have convenient pins.
@@ -286,7 +316,7 @@ void flexIOSetup() {
   flexIO->TIMCFG[0] = timerOutput | timerDecrement | timerReset | timerDisable | timerEnable | stopBit | startBit;
   flexIO->TIMCTL[0] = triggerSelect | triggerPolarity | triggerSource | pinConfig | pinSelect | pinPolarity | timerMode;
   
-  #define FLEXIO_CLOCK_DIVIDER 20 // Output clock frequency is 20 times slower than FlexIO clock (41.7 ns period); minimum value is 18 due to panel hardware.
+  #define FLEXIO_CLOCK_DIVIDER 20 // Output clock frequency is 20 times slower than FlexIO clock (41.7 ns period); limited by panel hardware.
   #define SHIFTS_PER_TRANSFER 4 // Shift out 4 times with every transfer = two 32-bit words = contents of Shifter 0 and Shifter 1
   flexIO->TIMCMP[0] = ((SHIFTS_PER_TRANSFER*2-1)<<8) | ((FLEXIO_CLOCK_DIVIDER/2-1)<<0);
 
@@ -296,7 +326,7 @@ void flexIOSetup() {
   Serial.println("FlexIO setup complete");
 }
 
-void flexPWMSetup(void) {
+FLASHMEM void flexPWMSetup(void) {
   /* Configure the FlexPWM peripheral to generate a pair of synchronized PWM signals for the panel LATCH and OE inputs.
    * The period and duty cycles are updated dynamically by timerUpdateDMA with each cycle according to the timerLUT lookup table. */
 
@@ -332,7 +362,7 @@ void flexPWMSetup(void) {
   Serial.println("PWM setup complete");
 }
 
-void dmaSetup() {
+FLASHMEM void dmaSetup() {
   unsigned int minorLoopBytes, minorLoopIterations, majorLoopBytes, majorLoopIterations, destinationAddressModulo;
   int destinationAddressOffset, destinationAddressLastOffset, sourceAddressOffset, sourceAddressLastOffset, minorLoopOffset;
   volatile uint32_t *destinationAddress1, *destinationAddress2, *sourceAddress;
@@ -418,10 +448,15 @@ void dmaSetup() {
   dataTransferDMA.disableOnCompletion(); // Set dataTransferDMA to automatically disable on completion (we have to enable it using enablerDMA)
   dataTransferDMA.triggerAtHardwareEvent(pFlex->hardware().shifters_dma_channel[1]); // Use FlexIO Shifter 1 trigger
 
-  /* Enable interrupt on completion of DMA transfer. This interrupt is used to format the row buffer data for the next row. */
+  /* Enable interrupt on completion of DMA transfer. This interrupt is used to update the DMA addresses to point to the next row. */
   dataTransferDMA.interruptAtCompletion();
   dataTransferDMA.attachInterrupt(rowUpdateISR);
 
+  /* Borrow the interrupt allocated to timerUpdateDMA to use as a software interrupt. It is triggered manually inside rowUpdateISR (not by timerUpdateDMA). */
+  #define ROW_CALCULATION_ISR_PRIORITY 240 // lowest priority
+  NVIC_SET_PRIORITY(IRQ_DMA_CH0 + timerUpdateDMA.channel, ROW_CALCULATION_ISR_PRIORITY);
+  timerUpdateDMA.attachInterrupt(rowCalculationISR);
+  
   /* Enable DMA channels (except dataTransferDMA which stays disabled, or else it would trigger continuously) */
   enablerDMA.enable();
   timerUpdateDMA.enable();
@@ -429,28 +464,46 @@ void dmaSetup() {
   Serial.println("DMA setup complete");
 }
 
-void rowUpdateISR(void) {
+FASTRUN void rowUpdateISR(void) {
   /* This interrupt runs at the completion of dataTransferDMA when a complete bitplane has been output to the panel.
-   * If we have finished all the bitplanes and we have exhausted the row buffer, it's time to update the row buffer with the 
-   * next row from the screen buffer. Otherwise, the interrupt does nothing if we are not done with all the bitplanes yet.
-   * At this point in the cycle, the timerUpdateDMA transfer for this bitplane already happened and the CITER count was decremented.
-   * If CITER = BITER that means that we just finished the last timer update transaction and the next one will be for a new row.
-   * In this case it's time to increase the currentRow counter and format the row data for the next row. */
-  dataTransferDMA.clearInterrupt();
+   * If we have finished all the bitplanes for this row, it's time to update the source address of the dataTransferDMA to
+   * point to the next row in the rowDataBuffer. Otherwise, the interrupt does nothing if we are not done with all the bitplanes yet.
+   * To determine whether all the bitplanes are done, we look at the timerUpdateDMA which keeps an iteration count that 
+   * corresponds to the bitplanes. In each cycle, timerUpdateDMA is serviced first, before rowUpdateISR.
+   * If CITER = BITER that means that timerUpdateDMA finished the last timer update transaction and the next one will be for a new row.
+   * In this case it's time to update dataTransferDMA to the next row.*/
+   
+  dataTransferDMA.clearInterrupt(); // if this line is at the end of the ISR then it does not clear fast enough and the ISR can be triggered twice
+  
   if ((timerUpdateDMA.TCD->CITER) == (timerUpdateDMA.TCD->BITER)) {
-    currentRow++;
-    if (currentRow >= ROWSPERFRAME) currentRow = 0;
-    setRowAddress(currentRow);
-    formatRowData(currentRow);
-    dataTransferDMA.TCD->SADDR = &(rowDataBuffer[0]); // reset dataTransferDMA to point to the first bitplane in the rowDataBuffer
+    rowBufferIndex = (rowBufferIndex + 1) % dmaBufferNumRows; // increment the index pointing to the location of the next row in the rowDataBuffer
+    --rowBufferFillCount; // indicates that the buffer needs to be refilled
+    dataTransferDMA.TCD->SADDR = &(rowDataBuffer[dmaBufferBytesPerRow*rowBufferIndex/sizeof(uint32_t)]); // update DMA source address
+    NVIC_SET_PENDING(IRQ_DMA_CH0 + timerUpdateDMA.channel); // trigger software interrupt rowCalculationISR()
+    setRowAddress(rowAddressBuffer[rowBufferIndex]); // change the row address we send to the panel
   }
 }
 
-inline void formatRowData(unsigned int row) {
-  /* adapted from smartMatrix library with modifications
+FASTRUN void rowCalculationISR(void) {
+  fillRowBuffer();
+}
+
+FASTRUN INLINE void fillRowBuffer(void) { // Refills the row buffer. It may be interrupted by the rowUpdateISR.
+  static unsigned int currentRow = 0; // global variable keeps track of the next row to write into the buffer
+  while (rowBufferFillCount != dmaBufferNumRows) { // loop until buffer is full
+    unsigned int freeRowBuffer = (rowBufferIndex + rowBufferFillCount) % dmaBufferNumRows; // index of the next free location in the rowDataBuffer
+    formatRowData(currentRow, freeRowBuffer); // take pixel data from the matrixBuffer and copy/reformat it into the rowDataBuffer
+    rowAddressBuffer[freeRowBuffer] = currentRow; // record the corresponding address in the rowAddressBuffer
+    ++rowBufferFillCount;
+    if (++currentRow >= matrixRowsPerFrame) currentRow = 0;
+  }
+}
+
+FASTRUN INLINE void formatRowData(unsigned int row, unsigned int freeRowBuffer) {
+  /* adapted from smartMatrix library (with modifications)
    * This code reads a new row of pixel data from the matrixBuffer, extracts the bit planes for each pixel, and reformats
    * the data into the format needed for the transfer to FlexIO, and stores that in the rowDataBuffer. 
-   * In fact, each row is interleaved with another row, (MATRIXHEIGHT/2)=16 rows later.
+   * In fact, each row is interleaved with another row, matrixRowPairOffset rows later.
    * The data structure in rowDataBuffer is organized as follows (different from smartMatrix implementation):
    * The overall buffer is divided into "latchesPerRow" sectors, each of which corresponds to a single bitplane. The first
    * sector is the LSB and the last sector is the MSB.
@@ -469,39 +522,87 @@ inline void formatRowData(unsigned int row) {
     memset(tempRow1, 0, sizeof(tempRow1));
     memset(tempRow2, 0, sizeof(tempRow2));
 
-    /* Load the current row into tempRow1, and the interleaved row (16 rows down) into tempRow2, performing gamma decoding */
-    for(int i=0; i<MATRIXWIDTH; i++) {
-        rgb24 currentPixel = matrixBuffer[i+row*MATRIXWIDTH];
-        tempRow1[i] = rgb48(gammaLUT8to16[currentPixel.red],
-            gammaLUT8to16[currentPixel.green],
-            gammaLUT8to16[currentPixel.blue]);
-        currentPixel = matrixBuffer[i+(row+(MATRIXHEIGHT/2))*MATRIXWIDTH];
-        tempRow2[i] = rgb48(gammaLUT8to16[currentPixel.red],
-            gammaLUT8to16[currentPixel.green],
-            gammaLUT8to16[currentPixel.blue]);
+    /* Load the 2 rows from the matrixBuffer and store in tempRow1 and tempRow2. Moves through the entire chain of panels and extracts
+       rows from each one, using the stacking options to get the correct rows (some panels can be upside down). */
+    int y1, y2;
+    for(int i=0; i<MATRIX_STACK_HEIGHT; i++) {
+        // Z-shape, bottom to top
+        if(!(optionFlags & SMARTMATRIX_OPTIONS_C_SHAPE_STACKING) &&
+            (optionFlags & SMARTMATRIX_OPTIONS_BOTTOM_TO_TOP_STACKING)) {
+            // fill data from bottom to top, so bottom panel is the one closest to Teensy
+            y1 = row + (MATRIX_STACK_HEIGHT-i-1)*matrixPanelHeight;
+            y2 = y1 + matrixRowPairOffset;
+        // Z-shape, top to bottom
+        } else if(!(optionFlags & SMARTMATRIX_OPTIONS_C_SHAPE_STACKING) &&
+            !(optionFlags & SMARTMATRIX_OPTIONS_BOTTOM_TO_TOP_STACKING)) {
+            // fill data from top to bottom, so top panel is the one closest to Teensy
+            y1 = row + i*matrixPanelHeight;
+            y2 = y1 + matrixRowPairOffset;
+        // C-shape, bottom to top
+        } else if((optionFlags & SMARTMATRIX_OPTIONS_C_SHAPE_STACKING) &&
+            (optionFlags & SMARTMATRIX_OPTIONS_BOTTOM_TO_TOP_STACKING)) {
+            // alternate direction of filling (or loading) for each matrixwidth
+            // swap row order from top to bottom for each stack (tempRow1 filled with top half of panel, tempRow0 filled with bottom half)
+            if((MATRIX_STACK_HEIGHT-i+1)%2) {
+                y2 = (matrixRowsPerFrame-row-1) + (i)*matrixPanelHeight;
+                y1 = y2 + matrixRowPairOffset;
+            } else {
+                y1 = row + (i)*matrixPanelHeight;
+                y2 = y1 + matrixRowPairOffset;
+            }
+        // C-shape, top to bottom
+        } else if((optionFlags & SMARTMATRIX_OPTIONS_C_SHAPE_STACKING) && 
+            !(optionFlags & SMARTMATRIX_OPTIONS_BOTTOM_TO_TOP_STACKING)) {
+            if((MATRIX_STACK_HEIGHT-i)%2) {
+                y1 = row + (MATRIX_STACK_HEIGHT-i-1)*matrixPanelHeight;
+                y2 = y1 + matrixRowPairOffset;
+            } else {
+                y2 = (matrixRowsPerFrame-row-1) + (MATRIX_STACK_HEIGHT-i-1)*matrixPanelHeight;
+                y1 = y2 + matrixRowPairOffset;
+            }
+        }
+        int stackOffset = i*matrixWidth;
+        for(int j=0; j<matrixWidth; j++) {
+          rgb24 currentPixel1 = matrixBuffer[(y1*matrixWidth)+j];
+          rgb24 currentPixel2 = matrixBuffer[(y2*matrixWidth)+j];
+          tempRow1[j+stackOffset] = rgb48(gammaLUT8to16[currentPixel1.red],
+              gammaLUT8to16[currentPixel1.green],
+              gammaLUT8to16[currentPixel1.blue]);
+          tempRow2[j+stackOffset] = rgb48(gammaLUT8to16[currentPixel2.red],
+              gammaLUT8to16[currentPixel2.green],
+              gammaLUT8to16[currentPixel2.blue]);
+        }    
     }
 
+    uint32_t *startOfRowBuffer = (uint32_t*)rowDataBuffer + dmaBufferBytesPerRow*freeRowBuffer/sizeof(uint32_t);
+
     /* Step through the rows and extract 4 pixels (two successive pixels from both tempRow1 and tempRow2) */
-    int x = 0;
-    while(x < PIXELS_PER_LATCH) {
-        uint32_t *ptr = (uint32_t*)rowDataBuffer + x*sizeof(uint16_t)/sizeof(uint32_t);
-        
+    for (int i = 0; i < PIXELS_PER_LATCH; i+=2) {
+        uint32_t *ptr = startOfRowBuffer + i*sizeof(uint16_t)/sizeof(uint32_t);
         uint16_t r1, g1, b1, r2, g2, b2, r3, g3, b3, r4, g4, b4;
-        
-        r1 = tempRow1[x].red;
-        g1 = tempRow1[x].green;
-        b1 = tempRow1[x].blue;
-        r2 = tempRow2[x].red;
-        g2 = tempRow2[x].green;
-        b2 = tempRow2[x].blue;
-        x++;
-        r3 = tempRow1[x].red;
-        g3 = tempRow1[x].green;
-        b3 = tempRow1[x].blue;
-        r4 = tempRow2[x].red;
-        g4 = tempRow2[x].green;
-        b4 = tempRow2[x].blue;
-        x++;
+        int ind0, ind1;
+
+        // for upside down stacks, flip order
+        if((optionFlags & SMARTMATRIX_OPTIONS_C_SHAPE_STACKING) && !((i/matrixWidth)%2)) {
+            int tempPosition = ((i/matrixWidth) * matrixWidth) + matrixWidth - i%matrixWidth - 1;
+            ind0 = tempPosition;
+            ind1 = tempPosition-1;
+        } else {
+            ind0 = i;
+            ind1 = i+1;
+        }
+        r1 = tempRow1[ind0].red;
+        g1 = tempRow1[ind0].green;
+        b1 = tempRow1[ind0].blue;
+        r2 = tempRow2[ind0].red;
+        g2 = tempRow2[ind0].green;
+        b2 = tempRow2[ind0].blue;
+        r3 = tempRow1[ind1].red;
+        g3 = tempRow1[ind1].green;
+        b3 = tempRow1[ind1].blue;
+        r4 = tempRow2[ind1].red;
+        g4 = tempRow2[ind1].green;
+        b4 = tempRow2[ind1].blue;
 
         /* Union struct is a convenient way to reformat pixels by bitfields */
         union {
@@ -530,15 +631,16 @@ inline void formatRowData(unsigned int row) {
             rgbData.p1g2 = g4 >> bitplane;
             rgbData.p1b2 = b4 >> bitplane;
             *ptr = rgbData.word;
+           
             ptr += PIXELS_PER_LATCH*sizeof(uint16_t)/sizeof(uint32_t); // move pointer to next sector
         }
     }
 
     /* Now we have refreshed the rowDataBuffer and we need to flush cache so that the changes are seen by DMA */
-    arm_dcache_flush_delete((void*)rowDataBuffer, sizeof(rowDataBuffer));
+    arm_dcache_flush_delete((void*)startOfRowBuffer, dmaBufferBytesPerRow);
 }
 
-inline void setRowAddress(unsigned int row) {
+FASTRUN INLINE void setRowAddress(unsigned int row) {
   /* Row addressing makes use of the same pins that output RGB color data. This is enabled by additional hardware on the SmartLED Shield.
      The row address signals are latched when the BUFFER_LATCH pin goes high. We need to output the address data without any clock pulses
      to avoid garbage pixel data. We can do this by putting the address data into a third shifter which outputs when the first two shifters
